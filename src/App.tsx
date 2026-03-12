@@ -1,15 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { 
   BarChart3, 
-  Search, 
   TrendingUp, 
   AlertCircle, 
-  Plus, 
   RefreshCw,
-  ChevronRight,
   Target,
   ShieldAlert,
-  Zap
+  Zap,
+  Database
 } from 'lucide-react';
 import { 
   LineChart, 
@@ -42,16 +40,21 @@ interface ScanResult {
   score: number;
 }
 
+interface UniverseMeta {
+  count: number;
+  lastUpdated: string | null;
+}
+
 export default function App() {
   const [results, setResults] = useState<ScanResult[]>([]);
   const [loading, setLoading] = useState(false);
-  const [universe, setUniverse] = useState<{ symbol: string }[]>([]);
-  const [newTicker, setNewTicker] = useState('');
+  const [universeMeta, setUniverseMeta] = useState<UniverseMeta>({ count: 0, lastUpdated: null });
+  const [updatingUniverse, setUpdatingUniverse] = useState(false);
   const [selectedStock, setSelectedStock] = useState<ScanResult | null>(null);
 
   useEffect(() => {
     fetchLatestScan();
-    fetchUniverse();
+    fetchUniverseMeta();
   }, []);
 
   const fetchLatestScan = async () => {
@@ -65,43 +68,54 @@ export default function App() {
     }
   };
 
-  const fetchUniverse = async () => {
+  const fetchUniverseMeta = async () => {
     try {
       const res = await fetch('/api/universe');
       const data = await res.json();
-      setUniverse(data);
+      setUniverseMeta(data);
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const updateUniverse = async () => {
+    setUpdatingUniverse(true);
+    try {
+      await fetch('/api/universe/update', { method: 'POST' });
+      await fetchUniverseMeta();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setUpdatingUniverse(false);
     }
   };
 
   const runScan = async () => {
     setLoading(true);
     try {
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/e8aa03b7-da89-4850-bc69-7463913932d1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'H4',location:'src/App.tsx:runScan:beforeFetch',message:'Frontend starting scan request',data:{existingResults:results.length},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       const res = await fetch('/api/scan', { method: 'POST' });
       const data = await res.json();
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/e8aa03b7-da89-4850-bc69-7463913932d1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'H4',location:'src/App.tsx:runScan:afterFetch',message:'Frontend received scan response',data:{ok:res.ok,status:res.status,resultCount:Array.isArray(data)?data.length:null},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       setResults(data);
       if (data.length > 0) setSelectedStock(data[0]);
     } catch (e) {
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/e8aa03b7-da89-4850-bc69-7463913932d1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'H1',location:'src/App.tsx:runScan:catch',message:'Frontend scan request failed',data:{error:String(e)},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       console.error(e);
     } finally {
       setLoading(false);
     }
   };
 
-  const addTicker = async () => {
-    if (!newTicker) return;
-    try {
-      await fetch('/api/universe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbols: [newTicker.toUpperCase()] })
-      });
-      setNewTicker('');
-      fetchUniverse();
-    } catch (e) {
-      console.error(e);
-    }
+  const formatDate = (iso: string | null) => {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
   };
 
   return (
@@ -118,24 +132,29 @@ export default function App() {
           </div>
         </div>
         
-        <div className="flex items-center gap-4">
-          <div className="flex bg-white border border-[#141414] rounded-sm overflow-hidden">
-            <input 
-              type="text" 
-              placeholder="ADD TICKER (E.G. AAPL)" 
-              className="px-3 py-2 text-xs outline-none w-40 uppercase"
-              value={newTicker}
-              onChange={(e) => setNewTicker(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && addTicker()}
-            />
-            <button 
-              onClick={addTicker}
-              className="bg-[#141414] text-[#E4E3E0] px-3 py-2 hover:bg-opacity-90 transition-colors"
-            >
-              <Plus size={16} />
-            </button>
+        <div className="flex items-center gap-6">
+          {/* Universe stats */}
+          <div className="flex items-center gap-3 border border-[#141414] px-4 py-2 bg-white/60 rounded-sm">
+            <Database size={14} className="opacity-50 shrink-0" />
+            <div className="text-[10px] uppercase tracking-widest leading-tight">
+              <span className="font-bold">{universeMeta.count.toLocaleString()} stocks</span>
+              <span className="opacity-40 mx-2">·</span>
+              <span className="opacity-60">Updated {formatDate(universeMeta.lastUpdated)}</span>
+            </div>
           </div>
-          
+
+          <button
+            onClick={updateUniverse}
+            disabled={updatingUniverse}
+            className={cn(
+              "flex items-center gap-2 border border-[#141414] text-[#141414] px-4 py-2 rounded-sm font-bold uppercase text-[10px] tracking-widest hover:bg-[#141414] hover:text-[#E4E3E0] transition-all",
+              updatingUniverse && "opacity-50 cursor-not-allowed"
+            )}
+          >
+            {updatingUniverse ? <RefreshCw className="animate-spin w-3 h-3" /> : <RefreshCw className="w-3 h-3" />}
+            {updatingUniverse ? 'Updating...' : 'Update Universe'}
+          </button>
+
           <button 
             onClick={runScan}
             disabled={loading}
@@ -292,8 +311,8 @@ export default function App() {
       {/* Footer / Status Bar */}
       <footer className="fixed bottom-0 left-0 right-0 bg-[#141414] text-[#E4E3E0] px-6 py-2 flex justify-between items-center text-[10px] uppercase tracking-widest font-bold">
         <div className="flex gap-6">
-          <span>Universe Size: {universe.length}</span>
-          <span>Last Scan: {new Date().toLocaleDateString()}</span>
+          <span>Universe Size: {universeMeta.count.toLocaleString()}</span>
+          <span>Last Update: {formatDate(universeMeta.lastUpdated)}</span>
         </div>
         <div className="flex gap-4">
           <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-emerald-500" /> System Active</span>
