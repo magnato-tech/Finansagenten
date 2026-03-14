@@ -32,6 +32,12 @@ interface ScanResult {
   stopLoss: number;
   patterns: string[];
   score: number;
+  scoreBreakdown: Record<string, number>;
+  scoreBuckets: {
+    trend: number;
+    pattern: number;
+    context: number;
+  };
 }
 
 interface UniverseMeta {
@@ -39,16 +45,63 @@ interface UniverseMeta {
   lastUpdated: string | null;
 }
 
+interface ScoreWeights {
+  wTrendAboveMa50: number;
+  wTrendMa50AboveMa200: number;
+  wBreakout: number;
+  wMa50Reclaim: number;
+  wPullback: number;
+  wMa50Pressure: number;
+  wVixRegime: number;
+  wVolumeConfirmation: number;
+}
+
 interface ScannerSettings {
   minDollarVolume: number;
   minPrice: number;
+  scoreWeights: ScoreWeights;
 }
 
 interface FilterImpact {
   universe: number;
   afterPrice: number;
   afterDollarVolume: number;
+  chartDataAvailable: number;
+  enoughBars: number;
+  scoredUniverse: number;
   settings: ScannerSettings;
+}
+
+interface ScanStats {
+  hardFilters: {
+    universe: number;
+    afterPrice: number;
+    afterDollarVolume: number;
+    chartDataAvailable: number;
+    enoughBars: number;
+    scoredUniverse: number;
+  };
+  scoreSummary: {
+    maxScore: number;
+    trendMax: number;
+    patternMax: number;
+    contextMax: number;
+    coverage: {
+      trendAboveMa50: number;
+      trendMa50AboveMa200: number;
+      breakout: number;
+      pullback: number;
+      ma50Reclaim: number;
+      ma50Pressure: number;
+      volumeConfirmedReclaim: number;
+      positiveLowVixTrend: number;
+    };
+  };
+  attempted: number;
+  failed: number;
+  candidates: number;
+  sampleErrors: { symbol: string; message: string }[];
+  scannedAt: string;
 }
 
 interface UniverseProgress {
@@ -63,11 +116,40 @@ interface UniverseProgress {
   error: string | null;
 }
 
+interface ChartRefreshProgress {
+  running: boolean;
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+}
+
+interface ChartStatus {
+  cachedSymbols: number;
+  totalRows: number;
+  lastDate: string | null;
+}
+
 type ActiveTab = 'scanner' | 'settings';
+
+const DEFAULT_WEIGHTS: ScoreWeights = {
+  wTrendAboveMa50: 20,
+  wTrendMa50AboveMa200: 30,
+  wBreakout: 50,
+  wMa50Reclaim: 40,
+  wPullback: 30,
+  wMa50Pressure: 20,
+  wVixRegime: 25,
+  wVolumeConfirmation: 30,
+};
 
 const DEFAULTS: ScannerSettings = {
   minDollarVolume: 5_000_000,
   minPrice: 3,
+  scoreWeights: DEFAULT_WEIGHTS,
 };
 
 function formatMarketCap(n: number): string {
@@ -87,6 +169,14 @@ function dropOff(from: number, to: number): string {
   return `-${(((from - to) / from) * 100).toFixed(1)}%`;
 }
 
+function getScoreBand(score: number, maxScore: number) {
+  if (maxScore === 0) return { label: 'Neutral', className: 'text-[#141414]/60' };
+  const ratio = score / maxScore;
+  if (ratio >= 0.7) return { label: 'Strong', className: 'text-emerald-600' };
+  if (ratio >= 0.45) return { label: 'Moderate', className: 'text-amber-600' };
+  return { label: 'Weak', className: 'text-rose-600' };
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('scanner');
 
@@ -96,10 +186,17 @@ export default function App() {
   const [universeMeta, setUniverseMeta] = useState<UniverseMeta>({ count: 0, lastUpdated: null });
   const [updatingUniverse, setUpdatingUniverse] = useState(false);
   const [selectedStock, setSelectedStock] = useState<ScanResult | null>(null);
+  const [scanStats, setScanStats] = useState<ScanStats | null>(null);
 
   // Universe update progress
   const [updateProgress, setUpdateProgress] = useState<UniverseProgress | null>(null);
   const pollingRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Chart cache state
+  const [chartStatus, setChartStatus] = useState<ChartStatus | null>(null);
+  const [chartRefreshProgress, setChartRefreshProgress] = useState<ChartRefreshProgress | null>(null);
+  const [refreshingCharts, setRefreshingCharts] = useState(false);
+  const chartPollingRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Settings state
   const [settings, setSettings] = useState<ScannerSettings>(DEFAULTS);
@@ -113,6 +210,7 @@ export default function App() {
     fetchUniverseMeta();
     fetchSettings();
     fetchFilterImpact();
+    fetchChartStatus();
     // Resume polling if a universe update is already in progress when page loads
     fetch('/api/universe/progress')
       .then((r) => r.json())
@@ -124,14 +222,28 @@ export default function App() {
         }
       })
       .catch(() => {});
+    // Resume chart polling if a chart refresh is already running
+    fetch('/api/charts/progress')
+      .then((r) => r.json())
+      .then((data: ChartRefreshProgress) => {
+        if (data.running) {
+          setChartRefreshProgress(data);
+          setRefreshingCharts(true);
+          startChartPolling();
+        }
+      })
+      .catch(() => {});
   }, []);
 
   const fetchLatestScan = async () => {
     try {
       const res = await fetch('/api/scan/latest');
       const data = await res.json();
-      setResults(data);
-      if (data.length > 0) setSelectedStock(data[0]);
+      const candidates: ScanResult[] = data.candidates ?? [];
+      setResults(candidates);
+      setScanStats(data.stats ?? null);
+      if (candidates.length > 0) setSelectedStock(candidates[0]);
+      if (candidates.length === 0) setSelectedStock(null);
     } catch (e) {
       console.error(e);
     }
@@ -151,8 +263,13 @@ export default function App() {
     try {
       const res = await fetch('/api/settings');
       const data = await res.json();
-      setSettings(data);
-      setDraft(data);
+      const merged: ScannerSettings = {
+        ...DEFAULTS,
+        ...data,
+        scoreWeights: { ...DEFAULT_WEIGHTS, ...(data.scoreWeights ?? {}) },
+      };
+      setSettings(merged);
+      setDraft(merged);
     } catch (e) {
       console.error(e);
     }
@@ -199,6 +316,58 @@ export default function App() {
     });
   };
 
+  const fetchChartStatus = async () => {
+    try {
+      const res = await fetch('/api/charts/status');
+      const data = await res.json();
+      setChartStatus(data);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const pollChartProgress = async (): Promise<boolean> => {
+    try {
+      const res = await fetch('/api/charts/progress');
+      const data: ChartRefreshProgress = await res.json();
+      setChartRefreshProgress(data);
+      if (!data.running) {
+        setRefreshingCharts(false);
+        await fetchChartStatus();
+        return false;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    return true;
+  };
+
+  const startChartPolling = () => {
+    if (chartPollingRef.current) clearInterval(chartPollingRef.current);
+    pollChartProgress().then((stillRunning) => {
+      if (!stillRunning) return;
+      chartPollingRef.current = setInterval(async () => {
+        const still = await pollChartProgress();
+        if (!still && chartPollingRef.current) {
+          clearInterval(chartPollingRef.current);
+          chartPollingRef.current = null;
+        }
+      }, 2000);
+    });
+  };
+
+  const refreshCharts = async () => {
+    setRefreshingCharts(true);
+    try {
+      const res = await fetch('/api/charts/refresh', { method: 'POST' });
+      if (res.status === 409) return;
+      startChartPolling();
+    } catch (e) {
+      console.error(e);
+      setRefreshingCharts(false);
+    }
+  };
+
   const updateUniverse = async () => {
     setUpdatingUniverse(true);
     try {
@@ -214,20 +383,14 @@ export default function App() {
   const runScan = async () => {
     setLoading(true);
     try {
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/e8aa03b7-da89-4850-bc69-7463913932d1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'H4',location:'src/App.tsx:runScan:beforeFetch',message:'Frontend starting scan request',data:{existingResults:results.length},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       const res = await fetch('/api/scan', { method: 'POST' });
       const data = await res.json();
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/e8aa03b7-da89-4850-bc69-7463913932d1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'H4',location:'src/App.tsx:runScan:afterFetch',message:'Frontend received scan response',data:{ok:res.ok,status:res.status,resultCount:Array.isArray(data)?data.length:null},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
-      setResults(data);
-      if (data.length > 0) setSelectedStock(data[0]);
+      const candidates: ScanResult[] = data.candidates ?? [];
+      setResults(candidates);
+      setScanStats(data.stats ?? null);
+      if (candidates.length > 0) setSelectedStock(candidates[0]);
+      if (candidates.length === 0) setSelectedStock(null);
     } catch (e) {
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/e8aa03b7-da89-4850-bc69-7463913932d1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'pre-fix',hypothesisId:'H1',location:'src/App.tsx:runScan:catch',message:'Frontend scan request failed',data:{error:String(e)},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       console.error(e);
     } finally {
       setLoading(false);
@@ -247,7 +410,12 @@ export default function App() {
         alert((err as { error: string }).error ?? 'Failed to save settings');
         return;
       }
-      const saved: ScannerSettings = await res.json();
+      const savedRaw = await res.json();
+      const saved: ScannerSettings = {
+        ...DEFAULTS,
+        ...savedRaw,
+        scoreWeights: { ...DEFAULT_WEIGHTS, ...(savedRaw.scoreWeights ?? {}) },
+      };
       setSettings(saved);
       setDraft(saved);
       setSettingsSaved(true);
@@ -270,7 +438,12 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(DEFAULTS),
       });
-      const saved: ScannerSettings = await res.json();
+      const savedRaw = await res.json();
+      const saved: ScannerSettings = {
+        ...DEFAULTS,
+        ...savedRaw,
+        scoreWeights: { ...DEFAULT_WEIGHTS, ...(savedRaw.scoreWeights ?? {}) },
+      };
       setSettings(saved);
       setDraft(saved);
       await fetchFilterImpact();
@@ -283,7 +456,10 @@ export default function App() {
 
   const isDirty =
     draft.minDollarVolume !== settings.minDollarVolume ||
-    draft.minPrice !== settings.minPrice;
+    draft.minPrice !== settings.minPrice ||
+    (Object.keys(DEFAULT_WEIGHTS) as (keyof ScoreWeights)[]).some(
+      (k) => draft.scoreWeights[k] !== settings.scoreWeights[k],
+    );
 
   const formatDate = (iso: string | null) => {
     if (!iso) return '—';
@@ -324,6 +500,18 @@ export default function App() {
           >
             <RefreshCw className={cn('w-3 h-3', updatingUniverse && 'animate-spin')} />
             {updatingUniverse ? 'Updating...' : 'Update Universe'}
+          </button>
+
+          <button
+            onClick={refreshCharts}
+            disabled={refreshingCharts}
+            className={cn(
+              'flex items-center gap-2 border border-[#141414] text-[#141414] px-4 py-2 rounded-sm font-bold uppercase text-[10px] tracking-widest hover:bg-[#141414] hover:text-[#E4E3E0] transition-all',
+              refreshingCharts && 'opacity-50 cursor-not-allowed',
+            )}
+          >
+            <Database className={cn('w-3 h-3', refreshingCharts && 'animate-pulse')} />
+            {refreshingCharts ? 'Caching...' : 'Refresh Charts'}
           </button>
 
           <button
@@ -401,6 +589,49 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Chart Refresh Progress Banner ── */}
+      {chartRefreshProgress && (chartRefreshProgress.running || (chartRefreshProgress.finishedAt != null)) && (
+        <div className={cn(
+          'border-b border-[#141414] px-6 py-3',
+          chartRefreshProgress.error ? 'bg-rose-50' : 'bg-blue-50/60',
+        )}>
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-3">
+              {chartRefreshProgress.running && <Database size={13} className="animate-pulse opacity-60 shrink-0" />}
+              <span className="text-[11px] font-bold uppercase tracking-widest">
+                {chartRefreshProgress.running
+                  ? `Henter kursdata fra Yahoo Finance… (${chartRefreshProgress.completed.toLocaleString()} / ${chartRefreshProgress.total.toLocaleString()})`
+                  : chartRefreshProgress.error
+                  ? `Feil: ${chartRefreshProgress.error}`
+                  : `✓ Chart-cache oppdatert — ${chartRefreshProgress.succeeded.toLocaleString()} aksjer cachet`}
+              </span>
+            </div>
+            <div className="flex items-center gap-4 text-[10px] font-mono opacity-60">
+              {chartRefreshProgress.total > 0 && chartRefreshProgress.running && (
+                <>
+                  <span className="text-emerald-600">+{chartRefreshProgress.succeeded.toLocaleString()}</span>
+                  {chartRefreshProgress.failed > 0 && (
+                    <span className="text-rose-500">–{chartRefreshProgress.failed.toLocaleString()}</span>
+                  )}
+                </>
+              )}
+              {!chartRefreshProgress.running && chartRefreshProgress.finishedAt && (
+                <span className="opacity-40">Ferdig {new Date(chartRefreshProgress.finishedAt).toLocaleTimeString('no-NO')}</span>
+              )}
+            </div>
+          </div>
+          {chartRefreshProgress.total > 0 && (
+            <div className="h-1 bg-[#E4E3E0] rounded-full overflow-hidden">
+              <motion.div
+                className={cn('h-full rounded-full', chartRefreshProgress.error ? 'bg-rose-500' : 'bg-blue-600')}
+                animate={{ width: `${(chartRefreshProgress.completed / chartRefreshProgress.total) * 100}%` }}
+                transition={{ duration: 0.4, ease: 'easeOut' }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ── SCANNER TAB ── */}
       {activeTab === 'scanner' && (
         <main className="grid grid-cols-12 h-[calc(100vh-137px)]">
@@ -410,6 +641,47 @@ export default function App() {
               <h2 className="text-[11px] uppercase tracking-[0.2em] font-bold italic font-serif">Top Candidates</h2>
               <span className="text-[10px] opacity-50">{results.length} Stocks Found</span>
             </div>
+
+            {/* Scan Statistics */}
+            {scanStats && (
+              <div className="border-b border-[#141414] bg-[#141414]/5 px-4 py-3 space-y-2">
+                <p className="text-[9px] uppercase tracking-widest font-bold opacity-40 mb-2">Last Scan Diagnostics</p>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                  {[
+                    { label: 'Scored universe', value: scanStats.hardFilters.scoredUniverse },
+                    { label: 'Top returned', value: scanStats.candidates },
+                    { label: 'Max score', value: scanStats.scoreSummary.maxScore },
+                    { label: 'Attempted', value: scanStats.attempted },
+                    { label: 'Failed', value: scanStats.failed, warn: scanStats.failed > scanStats.attempted * 0.3 },
+                    { label: 'Scanned at', value: formatDate(scanStats.scannedAt) as any },
+                  ].map((s) => (
+                    <div key={s.label} className="flex justify-between items-center">
+                      <span className="text-[9px] uppercase tracking-wider opacity-50">{s.label}</span>
+                      <span className={cn(
+                        'text-[10px] font-mono font-bold',
+                        s.warn ? 'text-rose-500' : 'opacity-70',
+                      )}>
+                        {typeof s.value === 'number' ? s.value.toLocaleString() : s.value}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                {scanStats.sampleErrors.length > 0 && (
+                  <details className="mt-1">
+                    <summary className="text-[9px] uppercase tracking-wider opacity-40 cursor-pointer">
+                      Sample errors ({scanStats.sampleErrors.length})
+                    </summary>
+                    <div className="mt-1 space-y-0.5">
+                      {scanStats.sampleErrors.map((e, i) => (
+                        <p key={i} className="text-[8px] font-mono opacity-40 truncate">
+                          {e.symbol}: {e.message}
+                        </p>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            )}
 
             <div className="divide-y divide-[#141414]">
               {results.map((stock, idx) => (
@@ -424,6 +696,10 @@ export default function App() {
                     selectedStock?.symbol === stock.symbol && 'bg-[#141414] text-[#E4E3E0]',
                   )}
                 >
+                  {(() => {
+                    const band = getScoreBand(stock.score, scanStats?.scoreSummary.maxScore ?? 0);
+                    return (
+                      <>
                   <div className="flex justify-between items-start mb-1">
                     <div className="flex items-center gap-2">
                       <span className="text-lg font-bold font-mono tracking-tighter">{stock.symbol}</span>
@@ -454,8 +730,17 @@ export default function App() {
                     <div className="flex items-center gap-1">
                       <span className="text-[9px] uppercase opacity-50">Score</span>
                       <span className="text-xs font-bold font-mono">{stock.score}</span>
+                      <span className={cn('text-[9px] font-bold uppercase', band.className)}>{band.label}</span>
                     </div>
                   </div>
+                  <div className="mt-2 flex gap-3 text-[9px] uppercase opacity-50 tracking-wider">
+                    <span>T {stock.scoreBuckets.trend}</span>
+                    <span>P {stock.scoreBuckets.pattern}</span>
+                    <span>C {stock.scoreBuckets.context}</span>
+                  </div>
+                      </>
+                    );
+                  })()}
                 </motion.div>
               ))}
 
@@ -518,15 +803,56 @@ export default function App() {
                       <Zap size={14} className="text-yellow-400" />
                       Detected Signals
                     </h3>
-                    <div className="flex flex-wrap gap-3">
-                      {selectedStock.patterns.map((p) => (
-                        <div
-                          key={p}
-                          className="px-4 py-2 border border-[#E4E3E0]/30 rounded-full text-sm font-bold italic font-serif"
-                        >
-                          {p}
+                    {selectedStock.patterns.length > 0 ? (
+                      <div className="flex flex-wrap gap-3">
+                        {selectedStock.patterns.map((p) => (
+                          <div
+                            key={p}
+                            className="px-4 py-2 border border-[#E4E3E0]/30 rounded-full text-sm font-bold italic font-serif"
+                          >
+                            {p}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm opacity-60">No pattern bonus this week. Ranking comes from trend/context score only.</p>
+                    )}
+                  </div>
+
+                  <div className="border border-[#141414] bg-white p-6">
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-[11px] uppercase tracking-[0.2em] font-bold flex items-center gap-2">
+                        <BarChart3 size={14} />
+                        Score Breakdown
+                      </h3>
+                      {(() => {
+                        const band = getScoreBand(selectedStock.score, scanStats?.scoreSummary.maxScore ?? 0);
+                        return <span className={cn('text-[10px] uppercase font-bold tracking-widest', band.className)}>{band.label}</span>;
+                      })()}
+                    </div>
+                    <div className="grid grid-cols-3 gap-4 mb-5">
+                      {[
+                        { label: 'Trend', value: selectedStock.scoreBuckets.trend, max: scanStats?.scoreSummary.trendMax ?? 0 },
+                        { label: 'Pattern', value: selectedStock.scoreBuckets.pattern, max: scanStats?.scoreSummary.patternMax ?? 0 },
+                        { label: 'Context', value: selectedStock.scoreBuckets.context, max: scanStats?.scoreSummary.contextMax ?? 0 },
+                      ].map((bucket) => (
+                        <div key={bucket.label} className="border border-[#141414]/20 px-4 py-3 bg-[#E4E3E0]/30">
+                          <div className="text-[10px] uppercase tracking-widest opacity-50">{bucket.label}</div>
+                          <div className="text-2xl font-mono font-bold mt-1">{bucket.value}<span className="opacity-30 text-base">/{bucket.max}</span></div>
                         </div>
                       ))}
+                    </div>
+                    <div className="space-y-2">
+                      {Object.entries(selectedStock.scoreBreakdown).length > 0 ? (
+                        Object.entries(selectedStock.scoreBreakdown).map(([label, value]) => (
+                          <div key={label} className="flex items-center justify-between border-b border-[#141414]/10 pb-2 text-sm">
+                            <span className="opacity-70">{label}</span>
+                            <span className="font-mono font-bold">+{value}</span>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="text-sm opacity-50">No active score signals on this symbol.</p>
+                      )}
                     </div>
                   </div>
 
@@ -556,6 +882,42 @@ export default function App() {
         <main className="h-[calc(100vh-137px)] overflow-y-auto p-8 pb-20">
           <div className="max-w-3xl mx-auto space-y-8">
 
+            {/* Chart Cache Status */}
+            <section>
+              <h2 className="text-[11px] uppercase tracking-[0.2em] font-bold mb-4 flex items-center gap-2">
+                <Database size={12} />
+                Chart Data Cache
+              </h2>
+              <div className="border border-[#141414] bg-white p-5 flex items-center justify-between gap-6">
+                <div className="space-y-1">
+                  <p className="text-sm font-bold">
+                    {chartStatus && chartStatus.cachedSymbols > 0
+                      ? `${chartStatus.cachedSymbols.toLocaleString()} aksjer cachet · ${(chartStatus.totalRows ?? 0).toLocaleString()} datapunkter`
+                      : 'Ingen chart-data i cache'}
+                  </p>
+                  <p className="text-[10px] opacity-50 uppercase tracking-widest">
+                    {chartStatus?.lastDate
+                      ? `Siste dato i cache: ${chartStatus.lastDate}`
+                      : 'Trykk "Refresh Charts" for å laste ned kurshistorikk for alle filtrerte aksjer'}
+                  </p>
+                  <p className="text-[10px] opacity-40 mt-2">
+                    Scan leser fra lokal cache — ingen Yahoo rate-limiting. Oppdater én gang i uken.
+                  </p>
+                </div>
+                <button
+                  onClick={refreshCharts}
+                  disabled={refreshingCharts}
+                  className={cn(
+                    'shrink-0 flex items-center gap-2 bg-[#141414] text-[#E4E3E0] px-5 py-2.5 rounded-sm font-bold uppercase text-[10px] tracking-widest transition-all',
+                    refreshingCharts ? 'opacity-50 cursor-not-allowed' : 'hover:invert',
+                  )}
+                >
+                  <Database className={cn('w-3 h-3', refreshingCharts && 'animate-pulse')} />
+                  {refreshingCharts ? 'Caching...' : 'Refresh Charts'}
+                </button>
+              </div>
+            </section>
+
             {/* Filter Funnel */}
             <section>
               <h2 className="text-[11px] uppercase tracking-[0.2em] font-bold mb-4 flex items-center gap-2">
@@ -584,6 +946,24 @@ export default function App() {
                         description: `Avg. daily turnover > ${formatMarketCap(filterImpact.settings.minDollarVolume)}`,
                         count: filterImpact.afterDollarVolume,
                         dropFrom: filterImpact.afterPrice,
+                      },
+                      {
+                        label: 'Chart Data Available',
+                        description: 'Cached OHLCV data found in local database',
+                        count: filterImpact.chartDataAvailable,
+                        dropFrom: filterImpact.afterDollarVolume,
+                      },
+                      {
+                        label: '>= 200 Bars',
+                        description: 'Enough valid history to calculate indicators',
+                        count: filterImpact.enoughBars,
+                        dropFrom: filterImpact.chartDataAvailable,
+                      },
+                      {
+                        label: 'Scored Universe',
+                        description: 'All remaining stocks receive a technical score',
+                        count: filterImpact.scoredUniverse,
+                        dropFrom: filterImpact.enoughBars,
                       },
                     ].map((stage, i) => {
                       const barWidth =
@@ -631,22 +1011,6 @@ export default function App() {
                         </div>
                       );
                     })}
-
-                    {/* Technical scan row */}
-                    <div className="p-5 bg-[#141414] text-[#E4E3E0] flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <Zap size={14} className="text-yellow-400 shrink-0" />
-                        <div>
-                          <div className="font-bold text-sm tracking-tight">Technical Scan</div>
-                          <div className="text-[10px] opacity-50 uppercase tracking-widest mt-0.5">
-                            Pattern detection · MA crossovers · Ranking
-                          </div>
-                        </div>
-                      </div>
-                      <span className="text-[10px] opacity-40 uppercase tracking-widest">
-                        Run scan to see results
-                      </span>
-                    </div>
                   </>
                 ) : (
                   <div className="p-12 text-center opacity-30 italic">
@@ -656,11 +1020,221 @@ export default function App() {
               </div>
             </section>
 
+            {/* Technical Score Coverage */}
+            <section>
+              <h2 className="text-[11px] uppercase tracking-[0.2em] font-bold mb-1 flex items-center gap-2">
+                <BarChart3 size={12} />
+                Technical Score Coverage
+              </h2>
+              <p className="text-[10px] opacity-40 uppercase tracking-widest mb-4">
+                Ingen aksjer ryker ut her. Tallene viser hvor mange i scored universe som treffer hvert poengsignal.
+              </p>
+
+              <div className="border border-[#141414] bg-white divide-y divide-[#141414]">
+                {scanStats ? (
+                  <>
+                    <div className="px-5 py-3 bg-[#141414]/5 text-[10px] uppercase tracking-widest opacity-60">
+                      Basert på siste weekly scan · {formatDate(scanStats.scannedAt)}
+                    </div>
+                    {[
+                      {
+                        title: 'Trend Signals',
+                        items: [
+                          {
+                            label: 'Price > MA50',
+                            count: scanStats.scoreSummary.coverage.trendAboveMa50,
+                            weight: settings.scoreWeights.wTrendAboveMa50,
+                          },
+                          {
+                            label: 'MA50 > MA200',
+                            count: scanStats.scoreSummary.coverage.trendMa50AboveMa200,
+                            weight: settings.scoreWeights.wTrendMa50AboveMa200,
+                          },
+                        ],
+                      },
+                      {
+                        title: 'Pattern Signals',
+                        items: [
+                          { label: 'Breakout', count: scanStats.scoreSummary.coverage.breakout, weight: settings.scoreWeights.wBreakout },
+                          { label: 'Pullback', count: scanStats.scoreSummary.coverage.pullback, weight: settings.scoreWeights.wPullback },
+                          { label: 'MA50 Reclaim', count: scanStats.scoreSummary.coverage.ma50Reclaim, weight: settings.scoreWeights.wMa50Reclaim },
+                          { label: 'MA50 Pressure', count: scanStats.scoreSummary.coverage.ma50Pressure, weight: settings.scoreWeights.wMa50Pressure },
+                        ],
+                      },
+                      {
+                        title: 'Context Signals',
+                        items: [
+                          {
+                            label: 'Volume-confirmed Reclaim',
+                            count: scanStats.scoreSummary.coverage.volumeConfirmedReclaim,
+                            weight: settings.scoreWeights.wVolumeConfirmation,
+                          },
+                          {
+                            label: 'Positive Low-VIX Trend',
+                            count: scanStats.scoreSummary.coverage.positiveLowVixTrend,
+                            weight: settings.scoreWeights.wVixRegime,
+                          },
+                        ],
+                      },
+                    ].map((group) => (
+                      <div key={group.title}>
+                        <div className="px-5 py-3 bg-[#141414]/5">
+                          <p className="text-[9px] uppercase tracking-widest font-bold opacity-50">{group.title}</p>
+                        </div>
+                        <div className="divide-y divide-[#141414]/10">
+                          {group.items.map((item) => {
+                            const total = scanStats.hardFilters.scoredUniverse;
+                            const barWidth = total > 0 ? `${(item.count / total) * 100}%` : '0%';
+                            return (
+                              <div key={item.label} className="p-5">
+                                <div className="flex items-center justify-between mb-3">
+                                  <div>
+                                    <div className="font-bold text-sm tracking-tight">{item.label}</div>
+                                    <div className="text-[10px] opacity-50 uppercase tracking-widest mt-0.5">
+                                      {pct(item.count, total)} av scored universe
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center gap-5">
+                                    <div className="text-right">
+                                      <div className="text-2xl font-mono font-bold leading-none">
+                                        {item.count.toLocaleString()}
+                                      </div>
+                                      <div className="text-[10px] font-mono opacity-40 mt-0.5">
+                                        Weight {item.weight}
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                                <div className="h-1.5 bg-[#E4E3E0] rounded-full overflow-hidden">
+                                  <motion.div
+                                    className="h-full bg-[#141414] rounded-full"
+                                    initial={{ width: 0 }}
+                                    animate={{ width: barWidth }}
+                                    transition={{ duration: 0.6, ease: 'easeOut' }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                    <div className="px-5 py-4 bg-[#141414] text-[#E4E3E0] flex justify-between items-center">
+                      <span className="text-[10px] uppercase tracking-widest opacity-60">Scored universe</span>
+                      <span className="font-mono font-bold text-lg">{scanStats.hardFilters.scoredUniverse.toLocaleString()}</span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="p-12 text-center opacity-30 italic">
+                    Run a weekly scan to inspect score signal coverage.
+                  </div>
+                )}
+              </div>
+            </section>
+
+            {/* Score Weights */}
+            <section>
+              <h2 className="text-[11px] uppercase tracking-[0.2em] font-bold mb-1 flex items-center gap-2">
+                <Zap size={12} />
+                Score Weights
+              </h2>
+              <p className="text-[10px] opacity-40 uppercase tracking-widest mb-4">
+                Justér vekting av de ulike score-komponentene. Max mulig score = sum av alle vekter.
+              </p>
+
+              <div className="border border-[#141414] bg-white divide-y divide-[#141414]">
+                {/* Trend */}
+                <div className="px-5 py-3 bg-[#141414]/5">
+                  <p className="text-[9px] uppercase tracking-widest font-bold opacity-50">Trend-komponenter</p>
+                </div>
+                {[
+                  { key: 'wTrendAboveMa50' as keyof ScoreWeights, label: 'Price > MA50', desc: 'Kortsiktig oppadgående trend' },
+                  { key: 'wTrendMa50AboveMa200' as keyof ScoreWeights, label: 'MA50 > MA200', desc: 'Langsiktig oppadgående struktur (Golden Cross-sone)' },
+                ].map(({ key, label, desc }) => (
+                  <div key={key} className="px-5 py-4 flex items-center gap-6">
+                    <div className="flex-1">
+                      <div className="font-bold text-sm">{label}</div>
+                      <div className="text-[10px] opacity-50 uppercase tracking-widest mt-0.5">{desc}</div>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={draft.scoreWeights[key]}
+                      onChange={(e) => setDraft((d) => ({ ...d, scoreWeights: { ...d.scoreWeights, [key]: Number(e.target.value) } }))}
+                      className="w-20 border border-[#141414] px-3 py-2 font-mono text-sm text-center bg-[#E4E3E0] focus:outline-none focus:ring-2 focus:ring-[#141414]"
+                    />
+                  </div>
+                ))}
+
+                {/* Patterns */}
+                <div className="px-5 py-3 bg-[#141414]/5">
+                  <p className="text-[9px] uppercase tracking-widest font-bold opacity-50">Mønster-bonuser</p>
+                </div>
+                {[
+                  { key: 'wBreakout' as keyof ScoreWeights, label: 'Breakout', desc: 'Pris over 20-dagers høy — sterkest signal' },
+                  { key: 'wMa50Reclaim' as keyof ScoreWeights, label: 'MA50 Reclaim', desc: 'Krysset over MA50 fra under — institusjonell interesse' },
+                  { key: 'wPullback' as keyof ScoreWeights, label: 'Pullback', desc: 'Tilbaketrekk til MA50 i oppadgående trend' },
+                  { key: 'wMa50Pressure' as keyof ScoreWeights, label: 'MA50 Pressure', desc: 'Gjentatt testing av MA50 fra under — oppbygning' },
+                ].map(({ key, label, desc }) => (
+                  <div key={key} className="px-5 py-4 flex items-center gap-6">
+                    <div className="flex-1">
+                      <div className="font-bold text-sm">{label}</div>
+                      <div className="text-[10px] opacity-50 uppercase tracking-widest mt-0.5">{desc}</div>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={draft.scoreWeights[key]}
+                      onChange={(e) => setDraft((d) => ({ ...d, scoreWeights: { ...d.scoreWeights, [key]: Number(e.target.value) } }))}
+                      className="w-20 border border-[#141414] px-3 py-2 font-mono text-sm text-center bg-[#E4E3E0] focus:outline-none focus:ring-2 focus:ring-[#141414]"
+                    />
+                  </div>
+                ))}
+
+                {/* Context */}
+                <div className="px-5 py-3 bg-[#141414]/5">
+                  <p className="text-[9px] uppercase tracking-widest font-bold opacity-50">Markedskontekst (nye)</p>
+                </div>
+                {[
+                  { key: 'wVolumeConfirmation' as keyof ScoreWeights, label: 'Volum-bekreftelse på MA50 Reclaim', desc: 'Høyt volum (>2x snitt) ved reclaim = institusjonell kjøping. Sett til 0 for å deaktivere.' },
+                  { key: 'wVixRegime' as keyof ScoreWeights, label: 'Positiv trend i lav-VIX-perioder', desc: 'Var aksjen stigende når VIX < 20 de siste 6 mnd? Svakhet nå kan være VIX-drevet, ikke fundamental. Sett til 0 for å deaktivere.' },
+                ].map(({ key, label, desc }) => (
+                  <div key={key} className="px-5 py-4 flex items-center gap-6">
+                    <div className="flex-1">
+                      <div className="font-bold text-sm">{label}</div>
+                      <div className="text-[10px] opacity-50 uppercase tracking-widest mt-0.5">{desc}</div>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={draft.scoreWeights[key]}
+                      onChange={(e) => setDraft((d) => ({ ...d, scoreWeights: { ...d.scoreWeights, [key]: Number(e.target.value) } }))}
+                      className="w-20 border border-[#141414] px-3 py-2 font-mono text-sm text-center bg-[#E4E3E0] focus:outline-none focus:ring-2 focus:ring-[#141414]"
+                    />
+                  </div>
+                ))}
+
+                {/* Max score summary */}
+                <div className="px-5 py-4 bg-[#141414] text-[#E4E3E0] flex justify-between items-center">
+                  <span className="text-[10px] uppercase tracking-widest opacity-60">Max mulig score</span>
+                  <span className="font-mono font-bold text-lg">
+                    {Object.values(draft.scoreWeights).reduce((a, b) => a + b, 0)}
+                  </span>
+                </div>
+              </div>
+            </section>
+
             {/* Settings Form */}
             <section>
               <h2 className="text-[11px] uppercase tracking-[0.2em] font-bold mb-4 flex items-center gap-2">
                 <Settings size={12} />
-                Scanner Settings
+                Hard Filter Settings
               </h2>
 
               <div className="border border-[#141414] bg-white p-6 space-y-6">
